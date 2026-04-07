@@ -1,15 +1,19 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from deepface import DeepFace
 import base64
-import cv2
-import numpy as np
-from typing import Optional
+import os
+import uuid
 
-app = FastAPI(title="Face AI Service")
+app = FastAPI(title="Face AI Service Optimized")
 
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+TEMP_DIR = "temp_faces"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# 🔥 Charger le modèle une seule fois (très important pour la vitesse)
+print("Loading face recognition model...")
+DeepFace.build_model("Facenet")
+print("Face model loaded successfully")
 
 
 class RegisterFaceRequest(BaseModel):
@@ -21,91 +25,38 @@ class FaceVerifyRequest(BaseModel):
     candidate_image: str
 
 
-def decode_base64_image(base64_string: str) -> np.ndarray:
+def save_base64_image(base64_string: str, prefix: str) -> str:
     if "," in base64_string:
         base64_string = base64_string.split(",", 1)[1]
 
     image_data = base64.b64decode(base64_string)
-    np_arr = np.frombuffer(image_data, np.uint8)
-    image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    filename = f"{prefix}_{uuid.uuid4().hex}.jpg"
+    filepath = os.path.join(TEMP_DIR, filename)
 
-    if image is None:
-        raise ValueError("Impossible de décoder l'image.")
+    with open(filepath, "wb") as f:
+        f.write(image_data)
 
-    return image
-
-
-def extract_face(image: np.ndarray) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(100, 100)
-    )
-
-    if len(faces) == 0:
-        return None
-
-    # garder le plus grand visage
-    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-
-    margin_x = int(w * 0.15)
-    margin_y = int(h * 0.15)
-
-    x1 = max(x - margin_x, 0)
-    y1 = max(y - margin_y, 0)
-    x2 = min(x + w + margin_x, image.shape[1])
-    y2 = min(y + h + margin_y, image.shape[0])
-
-    face = image[y1:y2, x1:x2]
-    return face
-
-
-def preprocess_face(face: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, (200, 200))
-    normalized = cv2.equalizeHist(resized)
-    return normalized
-
-
-def compare_faces(reference_face: np.ndarray, candidate_face: np.ndarray) -> dict:
-    ref_processed = preprocess_face(reference_face)
-    cand_processed = preprocess_face(candidate_face)
-
-    # différence pixel
-    abs_diff = cv2.absdiff(ref_processed, cand_processed)
-    pixel_diff = float(np.mean(abs_diff))
-
-    # 👉 règle simple (plus fiable pour ton cas)
-    match = pixel_diff <= 40
-
-    similarity_score = max(0.0, 100.0 - pixel_diff)
-
-    print("PIXEL DIFF =", pixel_diff)
-    print("MATCH =", match)
-
-    return {
-        "match": bool(match),
-        "hist_score": 0.0,
-        "pixel_diff": pixel_diff,
-        "similarity_score": float(similarity_score)
-    }
+    return filepath
 
 
 @app.get("/")
 def home():
-    return {"message": "Face AI Service with OpenCV is running"}
+    return {"message": "Face AI Service Optimized is running"}
 
 
 @app.post("/check-face")
 def check_face(request: RegisterFaceRequest):
+    path = None
     try:
-        image = decode_base64_image(request.image)
-        face = extract_face(image)
+        path = save_base64_image(request.image, "check")
 
-        if face is None:
+        objs = DeepFace.extract_faces(
+            img_path=path,
+            detector_backend="opencv",
+            enforce_detection=True
+        )
+
+        if not objs:
             return {
                 "success": False,
                 "message": "Aucun visage détecté."
@@ -122,38 +73,37 @@ def check_face(request: RegisterFaceRequest):
             "message": str(e)
         }
 
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
 
 @app.post("/verify-face")
 def verify_face(request: FaceVerifyRequest):
+    ref_path = None
+    cand_path = None
+
     try:
-        ref_image = decode_base64_image(request.reference_image)
-        cand_image = decode_base64_image(request.candidate_image)
+        ref_path = save_base64_image(request.reference_image, "ref")
+        cand_path = save_base64_image(request.candidate_image, "cand")
 
-        ref_face = extract_face(ref_image)
-        cand_face = extract_face(cand_image)
+        result = DeepFace.verify(
+            img1_path=ref_path,
+            img2_path=cand_path,
+            model_name="Facenet",
+            detector_backend="opencv",
+            enforce_detection=True
+        )
 
-        if ref_face is None:
-            return {
-                "success": False,
-                "match": False,
-                "message": "Aucun visage détecté dans l'image de référence."
-            }
-
-        if cand_face is None:
-            return {
-                "success": False,
-                "match": False,
-                "message": "Aucun visage détecté dans l'image candidate."
-            }
-
-        result = compare_faces(ref_face, cand_face)
+        print("Face verification result:", result)
 
         return {
             "success": True,
-            "match": result["match"],
-            "hist_score": result["hist_score"],
-            "pixel_diff": result["pixel_diff"],
-            "similarity_score": result["similarity_score"],
+            "match": bool(result["verified"]),
+            "distance": float(result["distance"]),
+            "threshold": float(result["threshold"]),
+            "model": result["model"],
+            "detector_backend": result["detector_backend"],
             "message": "Comparaison effectuée avec succès."
         }
 
@@ -163,3 +113,9 @@ def verify_face(request: FaceVerifyRequest):
             "match": False,
             "message": str(e)
         }
+
+    finally:
+        if ref_path and os.path.exists(ref_path):
+            os.remove(ref_path)
+        if cand_path and os.path.exists(cand_path):
+            os.remove(cand_path)
